@@ -1,0 +1,524 @@
+// Apple Tech News — a single Cloudflare Worker.
+// Fetches the RSS/Atom feeds below, merges them newest-first, keeps each item's
+// image, and serves one fast page. Rendered page is cached at the edge for 10 min.
+// Headlines, short summaries and images link back to the original articles.
+
+const FEEDS = [
+  { id: '9to5mac',   name: '9to5Mac',   home: 'https://9to5mac.com',          color: '#1d8fe0', urls: ['https://9to5mac.com/feed/'] },
+  { id: 'macrumors', name: 'MacRumors', home: 'https://www.macrumors.com',    color: '#d6402f', urls: ['https://feeds.macrumors.com/MacRumors-All', 'https://www.macrumors.com/macrumors.xml'] },
+  { id: 'macworld',  name: 'Macworld',  home: 'https://www.macworld.com',     color: '#e8761a', urls: ['https://www.macworld.com/feed'] },
+  { id: 'iclarified', name: 'iClarified', home: 'https://www.iclarified.com', color: '#2f9e5b', urls: ['https://www.iclarified.com/rss', 'https://www.iclarified.com/feed'] },
+];
+
+const PAGE_TITLE = 'Apple Tech News';
+const ITEMS_PER_FEED = 25;
+const MAX_ITEMS = 80;        // per fresh load of the feeds
+const KEEP_DAYS = 7;         // how far back the page goes (needs the NEWS storage binding)
+const HISTORY_MAX = 600;     // safety cap on stored articles
+const CACHE_SECONDS = 600;
+const OG_IMAGE_LOOKUPS = 8; // max article-page lookups for items with no image in the feed
+const UA = 'Mozilla/5.0 (compatible; PersonalTechNewsPage/1.0)';
+
+// ---- Sign-in alert emails (Cloudflare Email Routing, send_email binding "EMAIL") ----
+// Worker variables (plain text, set in the dashboard):
+//   ALERT_TO  = address that receives the alerts (must be verified in Email Routing)
+//   ME_EMAILS = comma-separated list of your own sign-in addresses (marks "you" vs "guest")
+import { EmailMessage } from 'cloudflare:email';
+
+const ALERT_FROM = 'alerts@whomemc.com';
+const ALERT_QUIET_SECONDS = 12 * 3600; // one email per person + device + network per 12 hours
+
+async function loginAlert(request, env, site) {
+  try {
+    const who = (request.headers.get('Cf-Access-Authenticated-User-Email') || '').trim().toLowerCase();
+    if (!who || !env.EMAIL || !env.ALERT_TO || !/^[^\s@<>]+@[^\s@<>]+$/.test(who)) return;
+    const ip = request.headers.get('CF-Connecting-IP') || '';
+    const ua = (request.headers.get('User-Agent') || '').replace(/[\r\n]+/g, ' ').slice(0, 200);
+    const keyBytes = new TextEncoder().encode(who + '|' + ip + '|' + ua);
+    const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', keyBytes))].slice(0, 12).map(b => b.toString(16).padStart(2, '0')).join('');
+    const cache = caches.default;
+    const key = new Request('https://alerts.invalid/' + site.replace(/\W/g, '') + '/' + hash);
+    if (await cache.match(key)) return;
+    await cache.put(key, new Response('1', { headers: { 'Cache-Control': 'max-age=' + ALERT_QUIET_SECONDS } }));
+
+    const cf = request.cf || {};
+    const place = [cf.city, cf.region, cf.country].filter(Boolean).join(', ') || 'Unknown';
+    const device = (/iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Macintosh/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows PC' : 'Unknown device')
+      + ' · ' + (/Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Unknown browser');
+    const when = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' (Central)';
+    const me = String(env.ME_EMAILS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+    const mine = me.includes(who);
+    const name = who.split('@')[0].replace(/\+.*$/, '');
+    const subject = (mine ? 'You' : name) + ' signed in to ' + site;
+    const text = [
+      site, 'Someone signed in.', '',
+      'Who:     ' + who + (mine ? ' (you)' : ' (guest)'),
+      'When:    ' + when,
+      'Where:   ' + place + ' (approximate, from the network)',
+      'Device:  ' + device,
+      'Network: ' + ip, '',
+      mine ? "If this wasn't you, sign out everywhere in Cloudflare Zero Trust and change your password." :
+        "If this isn't someone you invited, remove their email in Cloudflare Zero Trust > Access > Policies.",
+    ].join('\r\n');
+    const mime = [
+      'From: ' + site + ' alerts <' + ALERT_FROM + '>',
+      'To: ' + env.ALERT_TO,
+      'Subject: ' + subject.replace(/[\r\n]+/g, ' '),
+      'Message-ID: <' + crypto.randomUUID() + '@whomemc.com>',
+      'Date: ' + new Date().toUTCString(),
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=utf-8',
+      'Content-Transfer-Encoding: 8bit',
+      '', text,
+    ].join('\r\n');
+    await env.EMAIL.send(new EmailMessage(ALERT_FROM, env.ALERT_TO, mime));
+  } catch (e) { console.log('loginAlert failed', e && e.message); }
+}
+// ---- end sign-in alert ----
+
+export default {
+  async fetch(request, env, ctx) {
+    ctx.waitUntil(loginAlert(request, env, 'Tech News'));
+    const url = new URL(request.url);
+    if (url.pathname !== '/' && url.pathname !== '/index.html') {
+      return new Response('Not found', { status: 404 });
+    }
+    const cache = caches.default;
+    const cacheKey = new Request(url.origin + '/', { method: 'GET' });
+    const refresh = url.searchParams.has('refresh');
+
+    if (!refresh) {
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+    }
+
+    const { items, errors } = await loadWithHistory(env);
+    const html = render(items, errors, Date.now());
+    const response = new Response(html, {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': `public, max-age=300, s-maxage=${CACHE_SECONDS}`,
+        'X-Robots-Tag': 'noindex, nofollow',
+        'Referrer-Policy': 'no-referrer',
+      },
+    });
+    // Only cache if at least something loaded, so a bad moment doesn't stick for 10 minutes.
+    if (items.length > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    return response;
+  },
+
+  // Optional hourly job (Cloudflare cron trigger) so history keeps filling even if nobody opens the page.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(loadWithHistory(env));
+  },
+};
+
+// ---------- loading ----------
+
+// Loads the feeds, then merges with the articles saved earlier so the page can reach back KEEP_DAYS.
+// If the NEWS storage (a Workers KV binding) isn't set up, it just returns the fresh feed items.
+async function loadWithHistory(env) {
+  const { items, errors } = await loadAll();
+  if (!env || !env.NEWS) return { items, errors };
+  try {
+    let old = [];
+    try { old = JSON.parse((await env.NEWS.get('items')) || '[]'); } catch (e) { old = []; }
+    const byLink = new Map();
+    for (const it of old) byLink.set(it.link, it);
+    for (const it of items) {
+      const prev = byLink.get(it.link);
+      byLink.set(it.link, prev && !it.image && prev.image ? { ...it, image: prev.image } : it);
+    }
+    const cutoff = Date.now() - KEEP_DAYS * 86400000;
+    const merged = [...byLink.values()]
+      .filter((it) => it.date >= cutoff)
+      .sort((a, b) => b.date - a.date)
+      .slice(0, HISTORY_MAX);
+    if (merged.length) await env.NEWS.put('items', JSON.stringify(merged));
+    return { items: merged.length ? merged : items, errors };
+  } catch (e) {
+    return { items, errors: errors.concat('history: ' + (e && e.message ? e.message : 'storage error')) };
+  }
+}
+
+async function loadAll() {
+  const results = await Promise.all(FEEDS.map(loadFeed));
+  const errors = [];
+  let items = [];
+  results.forEach((r, i) => {
+    if (r.error) errors.push(`${FEEDS[i].name}: ${r.error}`);
+    items = items.concat(r.items);
+  });
+
+  // de-duplicate by link, newest first
+  const seen = new Set();
+  items = items
+    .sort((a, b) => b.date - a.date)
+    .filter((it) => (seen.has(it.link) ? false : (seen.add(it.link), true)))
+    .slice(0, MAX_ITEMS);
+
+  // For a few items that have no image in the feed, look for the article's og:image.
+  const missing = items.filter((it) => !it.image).slice(0, OG_IMAGE_LOOKUPS);
+  await Promise.allSettled(
+    missing.map(async (it) => {
+      const res = await timeoutFetch(it.link, { headers: { 'User-Agent': UA }, cf: { cacheTtl: 3600, cacheEverything: true } }, 4000);
+      if (!res.ok) return;
+      const head = (await res.text()).slice(0, 80000);
+      const m =
+        head.match(/<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["']/i) ||
+        head.match(/<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["']/i);
+      if (m) it.image = absUrl(decodeEntities(m[1]), it.link);
+    })
+  );
+  return { items, errors };
+}
+
+async function loadFeed(feed) {
+  const tried = [];
+
+  async function attempt(u) {
+    try {
+      const res = await timeoutFetch(u, {
+        headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*' },
+        cf: { cacheTtl: CACHE_SECONDS, cacheEverything: true },
+      }, 8000);
+      if (!res.ok) { tried.push(`${u} → HTTP ${res.status}`); return null; }
+      const text = await res.text();
+      if (!looksLikeFeed(text)) { tried.push(`${u} → not a feed`); return null; }
+      const items = parseFeed(text, feed).slice(0, ITEMS_PER_FEED);
+      if (!items.length) { tried.push(`${u} → no items`); return null; }
+      return items;
+    } catch (e) {
+      tried.push(`${u} → ${e && e.name === 'AbortError' ? 'timeout' : 'failed'}`);
+      return null;
+    }
+  }
+
+  // 1) the configured feed addresses, in order
+  for (const u of feed.urls) {
+    const items = await attempt(u);
+    if (items) return { items, error: null };
+  }
+
+  // 2) auto-discover feed links advertised on the home page
+  try {
+    const res = await timeoutFetch(feed.home, { headers: { 'User-Agent': UA } }, 6000);
+    if (!res.ok) {
+      tried.push(`${feed.home} → HTTP ${res.status}`);
+    } else {
+      const html = (await res.text()).slice(0, 100000);
+      const tags = html.match(/<link\b[^>]*type=["']application\/(?:rss|atom)\+xml["'][^>]*>/gi) || [];
+      if (!tags.length) tried.push(`${feed.home} → no feed advertised`);
+      for (const t of tags) {
+        const href = attr(t, 'href');
+        if (!href) continue;
+        const items = await attempt(absUrl(href, feed.home));
+        if (items) return { items, error: null };
+      }
+    }
+  } catch (e) {
+    tried.push(`${feed.home} → ${e && e.name === 'AbortError' ? 'timeout' : 'failed'}`);
+  }
+  return { items: [], error: tried.join('; ') || 'no feed found' };
+}
+
+function timeoutFetch(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+// ---------- parsing ----------
+
+function looksLikeFeed(text) {
+  return /<(rss|feed|rdf:RDF)\b/i.test(text.slice(0, 3000));
+}
+
+function parseFeed(xml, feed) {
+  const blocks = xml.match(/<item\b[\s\S]*?<\/item>/gi) || xml.match(/<entry\b[\s\S]*?<\/entry>/gi) || [];
+  const items = [];
+  for (const b of blocks) {
+    const title = textOf(tagRaw(b, 'title'));
+    let link = textOf(tagRaw(b, 'link'));
+    if (!link) {
+      // Atom: <link rel="alternate" href="..."/>
+      const lt = (b.match(/<link\b[^>]*>/gi) || []).find((t) => !/rel=["'](?:self|enclosure|replies)["']/i.test(t));
+      if (lt) link = attr(lt, 'href') || '';
+    }
+    link = absUrl(link, feed.home);
+    if (!title || !link) continue;
+
+    const dateStr = textOf(tagRaw(b, 'pubDate')) || textOf(tagRaw(b, 'published')) || textOf(tagRaw(b, 'updated')) || textOf(tagRaw(b, 'dc:date'));
+    let date = Date.parse(dateStr);
+    if (!Number.isFinite(date)) date = Date.now();
+
+    const contentHtml = htmlOf(tagRaw(b, 'content:encoded')) || htmlOf(tagRaw(b, 'content'));
+    const descHtml = htmlOf(tagRaw(b, 'description')) || htmlOf(tagRaw(b, 'summary'));
+
+    const image =
+      mediaImage(b, 'media:content') ||
+      mediaImage(b, 'media:thumbnail') ||
+      enclosureImage(b) ||
+      firstImg(contentHtml) ||
+      firstImg(descHtml);
+
+    items.push({
+      source: feed.id,
+      title,
+      link,
+      date,
+      image: image ? absUrl(image, feed.home) : '',
+      summary: summarize(descHtml || contentHtml, title),
+    });
+  }
+  return items;
+}
+
+function tagRaw(block, name) {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const m = block.match(new RegExp(`<${n}(?:\\s[^>]*)?>([\\s\\S]*?)</${n}>`, 'i'));
+  return m ? m[1] : '';
+}
+
+// Plain text from a tag value (title, link, date).
+function textOf(raw) {
+  if (!raw) return '';
+  return collapse(stripTags(unwrapCdata(raw)));
+}
+
+// HTML from a tag value (content/description): CDATA kept as-is, otherwise entity-decoded.
+function htmlOf(raw) {
+  if (!raw) return '';
+  const cd = raw.match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+  return cd ? cd[1] : decodeEntities(raw);
+}
+
+function unwrapCdata(raw) {
+  const cd = raw.match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+  return cd ? cd[1] : decodeEntities(raw);
+}
+
+function stripTags(s) { return s.replace(/<[^>]*>/g, ' '); }
+function collapse(s) { return s.replace(/\s+/g, ' ').trim(); }
+
+function decodeEntities(s) {
+  const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…', mdash: '—', ndash: '–', rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“' };
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => {
+    if (e[0] === '#') {
+      const code = e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      try { return String.fromCodePoint(code); } catch (_) { return m; }
+    }
+    const v = named[e.toLowerCase()];
+    return v !== undefined ? v : m;
+  });
+}
+
+function attr(tag, name) {
+  const m = tag.match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i'));
+  return m ? decodeEntities(m[1] !== undefined ? m[1] : m[2]) : '';
+}
+
+function isImageUrl(u) { return /\.(?:jpe?g|png|gif|webp|avif)(?:\?|#|$)/i.test(u); }
+
+function mediaImage(block, tagName) {
+  const tags = block.match(new RegExp(`<${tagName.replace(':', '\\:')}\\b[^>]*>`, 'gi')) || [];
+  let fallback = '';
+  for (const t of tags) {
+    const u = attr(t, 'url');
+    if (!u) continue;
+    const medium = attr(t, 'medium').toLowerCase();
+    const type = attr(t, 'type').toLowerCase();
+    if (medium === 'image' || type.startsWith('image/') || isImageUrl(u)) return u;
+    if (!fallback && !medium && !type && tagName === 'media:thumbnail') fallback = u;
+  }
+  return fallback;
+}
+
+function enclosureImage(block) {
+  const tags = block.match(/<enclosure\b[^>]*>/gi) || [];
+  for (const t of tags) {
+    const u = attr(t, 'url');
+    const type = attr(t, 'type').toLowerCase();
+    if (u && (type.startsWith('image/') || isImageUrl(u))) return u;
+  }
+  return '';
+}
+
+function firstImg(html) {
+  if (!html) return '';
+  const imgs = html.match(/<img\b[^>]*>/gi) || [];
+  for (const t of imgs) {
+    const src = attr(t, 'data-src') || attr(t, 'data-lazy-src') || attr(t, 'src');
+    if (!src || src.startsWith('data:')) continue;
+    if (/pixel|tracker|feedburner|gravatar|\/emoji\/|spacer|1x1/i.test(src)) continue;
+    const w = parseInt(attr(t, 'width'), 10);
+    const h = parseInt(attr(t, 'height'), 10);
+    if ((w && w < 50) || (h && h < 50)) continue;
+    return src;
+  }
+  return '';
+}
+
+function summarize(html, title) {
+  let t = collapse(decodeEntities(stripTags(html || '')));
+  t = t.replace(/\s*(?:The post|Read more|Continue reading)\b.*$/i, '').trim();
+  if (t.toLowerCase().startsWith(title.toLowerCase())) t = t.slice(title.length).trim();
+  if (t.length <= 220) return t;
+  const cut = t.slice(0, 220);
+  return cut.slice(0, Math.max(cut.lastIndexOf(' '), 120)).replace(/[\s,.;:–-]+$/, '') + '…';
+}
+
+function absUrl(u, base) {
+  if (!u) return '';
+  try { return new URL(u, base).toString(); } catch (_) { return ''; }
+}
+
+// ---------- rendering ----------
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function ago(ms, now) {
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  return `${d}d ago`;
+}
+
+function render(items, errors, now) {
+  const byId = Object.fromEntries(FEEDS.map((f) => [f.id, f]));
+  const chips = [`<button class="chip on" data-src="all">All</button>`]
+    .concat(FEEDS.map((f) => `<button class="chip" data-src="${f.id}" style="--c:${f.color}">${esc(f.name)}</button>`))
+    .join('');
+
+  const cards = items.map((it) => {
+    const f = byId[it.source];
+    const img = it.image
+      ? `<img src="${esc(it.image)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentNode.classList.add('noimg');this.remove()">`
+      : '';
+    return `<article class="card" data-src="${it.source}" data-text="${esc((it.title + ' ' + it.summary + ' ' + f.name).toLowerCase())}" style="--c:${f.color}">
+  <a class="thumb${it.image ? '' : ' noimg'}" href="${esc(it.link)}" target="_blank" rel="noopener noreferrer" aria-hidden="true" tabindex="-1">${img}<span class="ph">${esc(f.name.slice(0, 1))}</span></a>
+  <div class="body">
+    <div class="meta"><span class="src">${esc(f.name)}</span><span class="when"><time datetime="${new Date(it.date).toISOString()}">${ago(it.date, now)}</time><button class="share" type="button" data-url="${esc(it.link)}" data-title="${esc(it.title)}" aria-label="Share this article" title="Share"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></button></span></div>
+    <h2><a href="${esc(it.link)}" target="_blank" rel="noopener noreferrer">${esc(it.title)}</a></h2>
+    ${it.summary ? `<p>${esc(it.summary)}</p>` : ''}
+  </div>
+</article>`;
+  }).join('\n');
+
+  const errNote = errors.length
+    ? `<p class="err">Couldn't load: ${esc(errors.join(' | '))}</p>`
+    : '';
+  const empty = items.length === 0 ? `<p class="empty">No stories could be loaded right now. Try again in a minute.</p>` : '';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="light dark">
+<title>${esc(PAGE_TITLE)}</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#14171c;--muted:#656d79;--line:#e3e6eb;--chip:#e9ecf1}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1013;--card:#171a1f;--text:#eceef1;--muted:#98a0ab;--line:#262a31;--chip:#22262d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.wrap{max-width:1200px;margin:0 auto;padding:20px 16px 48px}
+header{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between;margin-bottom:18px}
+h1{font-size:1.5rem;margin:0;letter-spacing:-.01em}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{appearance:none;border:1px solid transparent;background:var(--chip);color:var(--text);padding:7px 14px;border-radius:999px;font:inherit;font-size:.875rem;cursor:pointer}
+.chip:hover{border-color:var(--line)}
+.chip.on{background:var(--c,var(--text));color:#fff}
+.chip[data-src=all].on{background:var(--text);color:var(--bg)}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+.card[hidden]{display:none}
+.thumb{display:block;aspect-ratio:16/9;background:var(--chip);position:relative;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block;position:relative;z-index:1}
+.thumb .ph{position:absolute;inset:0;display:none;align-items:center;justify-content:center;font-size:3rem;font-weight:700;color:#fff;background:var(--c)}
+.thumb.noimg .ph{display:flex}
+.body{padding:12px 14px 16px;display:flex;flex-direction:column;gap:6px}
+.meta{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.78rem;color:var(--muted)}
+.when{display:flex;align-items:center;gap:6px}
+.share{appearance:none;border:0;background:var(--chip);color:var(--muted);width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0;font:inherit;font-size:.7rem}
+.share:hover{color:var(--text)}
+.share.done{width:auto;padding:0 10px;color:#0f5c2c}
+.src{font-weight:600;color:var(--c)}
+h2{font-size:1.02rem;line-height:1.3;margin:0}
+h2 a{color:inherit;text-decoration:none}
+h2 a:hover{text-decoration:underline}
+p{margin:0;color:var(--muted);font-size:.9rem}
+.search{display:flex;align-items:center;gap:12px;margin:0 0 16px}
+.sbox{position:relative;flex:1;max-width:520px}
+#q{width:100%;box-sizing:border-box;padding:10px 40px 10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font:inherit;font-size:1rem}
+#q::-webkit-search-cancel-button{-webkit-appearance:none;display:none}
+#clr{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:28px;height:28px;border:0;border-radius:50%;background:var(--chip);color:var(--muted);font-size:1.2rem;line-height:1;cursor:pointer;padding:0}
+#clr:hover{color:var(--text)}
+#clr[hidden]{display:none}
+#q:focus{outline:2px solid var(--text);outline-offset:1px}
+#count{color:var(--muted);font-size:.85rem;white-space:nowrap}
+.nomatch{color:var(--muted);padding:24px 0}
+footer{margin-top:24px;color:var(--muted);font-size:.8rem}
+.err,.empty{color:#b3261e;font-size:.85rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><h1>${esc(PAGE_TITLE)}</h1><nav class="chips" aria-label="Filter by source">${chips}</nav></header>
+<div class="search"><div class="sbox"><input id="q" type="search" placeholder="Search" autocomplete="off" aria-label="Search"><button id="clr" type="button" aria-label="Clear search" hidden>&times;</button></div><span id="count"></span></div>
+${empty}
+<main class="grid" id="grid">
+${cards}
+</main>
+<p class="nomatch" id="none" hidden>No matching stories.</p>
+<footer>Headlines and images belong to their publishers and link to the original articles. Updated <time id="upd" datetime="${new Date(now).toISOString()}"></time>.${errNote}</footer>
+</div>
+<script>
+(function(){
+  var chips=document.querySelectorAll('.chip'),cards=document.querySelectorAll('.card'),
+      q=document.getElementById('q'),count=document.getElementById('count'),none=document.getElementById('none'),active='all';
+  function apply(){
+    var terms=q.value.trim().toLowerCase().split(/\s+/).filter(Boolean),shown=0;
+    cards.forEach(function(k){
+      var ok=(active==='all'||k.dataset.src===active);
+      if(ok&&terms.length){var tx=k.dataset.text;for(var i=0;i<terms.length;i++){if(tx.indexOf(terms[i])<0){ok=false;break}}}
+      k.hidden=!ok;if(ok)shown++;
+    });
+    count.textContent=(terms.length||active!=='all')?(shown+' of '+cards.length):(cards.length+' stories');
+    none.hidden=shown>0||cards.length===0;
+  }
+  chips.forEach(function(c){c.addEventListener('click',function(){
+    chips.forEach(function(x){x.classList.toggle('on',x===c)});
+    active=c.dataset.src;apply();
+  })});
+  var clr=document.getElementById('clr');
+  function sync(){clr.hidden=!q.value}
+  document.addEventListener('click',function(e){
+    var b=e.target.closest&&e.target.closest('.share');if(!b)return;
+    var d={title:b.dataset.title,url:b.dataset.url};
+    if(navigator.share){navigator.share(d).catch(function(){});return}
+    var done=function(){var h=b.innerHTML;b.classList.add('done');b.textContent='Copied';setTimeout(function(){b.classList.remove('done');b.innerHTML=h},1500)};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(d.url).then(done,function(){})}
+  });
+  q.addEventListener('input',function(){sync();apply()});
+  clr.addEventListener('click',function(){q.value='';sync();apply();q.focus()});
+  document.addEventListener('keydown',function(e){
+    var t=e.target&&e.target.tagName;
+    if(e.key==='/'&&t!=='INPUT'&&t!=='TEXTAREA'){e.preventDefault();q.focus();}
+    else if(e.key==='Escape'&&document.activeElement===q){q.value='';sync();apply();q.blur();}
+  });
+  apply();
+  var u=document.getElementById('upd');
+  if(u){try{u.textContent=new Date(u.getAttribute('datetime')).toLocaleString([], {dateStyle:'medium',timeStyle:'short'})}catch(e){}}
+})();
+</script>
+</body>
+</html>`;
+}

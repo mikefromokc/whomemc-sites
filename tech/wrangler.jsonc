@@ -1,0 +1,9 @@
+{
+  "name": "tech",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-18",
+  "observability": { "enabled": true },
+  "kv_namespaces": [{ "binding": "NEWS", "id": "25fc1b553f754a17851bb45557850a1a" }],
+  "send_email": [{ "name": "EMAIL" }],
+  "triggers": { "crons": ["0 * * * *"] }
+}
