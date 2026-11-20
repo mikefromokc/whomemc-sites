@@ -15,6 +15,7 @@ const PAGE_TITLE = 'Deals';
 const ITEMS_PER_FEED = 100;
 const MAX_ITEMS = 300;
 const CACHE_SECONDS = 300; // deals move fast
+const DEAL_MAX_AGE_HOURS = 72; // older deals are usually expired
 const OG_IMAGE_LOOKUPS = 8; // max article-page lookups for items with no image in the feed
 const UA = 'Mozilla/5.0 (compatible; PersonalDealsPage/1.0)';
 
@@ -105,6 +106,33 @@ async function handlePrefs(request, env, url) {
   }
 }
 
+// ---------- near-duplicate collapse ----------
+// The same story or deal often shows up from two sources with slightly different titles.
+// Keep the newest, fill in a missing image or price from the other copy.
+const DUP_STOP = new Set(['the','and','for','with','from','this','that','your','you','are','free','shipping','off','new','amazon','at','on','in','of','to','a','an','by','up','get','deal','deals','sale']);
+function titleTokens(t) {
+  const m = String(t || '').toLowerCase().match(/[a-z0-9][a-z0-9.+\-]{1,}/g) || [];
+  return new Set(m.filter((w) => !DUP_STOP.has(w)));
+}
+function nearDup(a, b) {
+  if (a.size < 4 || b.size < 4) return false;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  return inter >= 4 && inter / (a.size + b.size - inter) >= 0.6;
+}
+function collapseNearDuplicates(items) {
+  const keep = [], toks = [];
+  for (const it of items) {
+    const t = titleTokens(it.title);
+    const i = toks.findIndex((x) => nearDup(t, x));
+    if (i < 0) { keep.push(it); toks.push(t); continue; }
+    const k = keep[i];
+    if (!k.image && it.image) k.image = it.image;
+    if (!k.price && it.price) { k.price = it.price; k.was = it.was; k.off = it.off; }
+  }
+  return keep;
+}
+
 // ---------- loading ----------
 
 async function loadAll() {
@@ -120,8 +148,13 @@ async function loadAll() {
   const seen = new Set();
   items = items
     .sort((a, b) => b.date - a.date)
-    .filter((it) => (seen.has(it.link) ? false : (seen.add(it.link), true)))
-    .slice(0, MAX_ITEMS);
+    .filter((it) => (seen.has(it.link) ? false : (seen.add(it.link), true)));
+
+  // Drop stale and expired deals (but never leave the page nearly empty).
+  const cutoff = Date.now() - DEAL_MAX_AGE_HOURS * 3600000;
+  const fresh = items.filter((it) => it.date >= cutoff && !/\bexpired\b/i.test(it.title + ' ' + (it.summary || '')));
+  if (fresh.length >= 20) items = fresh;
+  items = collapseNearDuplicates(items).slice(0, MAX_ITEMS);
 
   // For a few items that have no image in the feed, look for the article's og:image.
   const missing = items.filter((it) => !it.image).slice(0, OG_IMAGE_LOOKUPS);
@@ -470,6 +503,7 @@ const CLIENT_JS = String.raw`(function(){
     cards.forEach(function(k){
       var isH=!!H[k.dataset.link],ok=true;
       if(active==='foryou')ok=k._s>=2;
+      else if(active==='new')ok=k.classList.contains('new');
       else if(active!=='all')ok=k.dataset.src===active;
       if(isH&&!showHidden)ok=false;
       if(ok&&terms.length){var tx=k.dataset.text;for(var i=0;i<terms.length;i++){if(tx.indexOf(terms[i])<0){ok=false;break}}}
@@ -554,6 +588,11 @@ const CLIENT_JS = String.raw`(function(){
     else if(e.key==='Escape'&&document.activeElement===q){q.value='';sync();apply();q.blur();}
   });
 
+  var prev=0;
+  try{var ps=sessionStorage.getItem('prevSeen');if(ps===null){ps=localStorage.getItem('lastSeen')||'0';sessionStorage.setItem('prevSeen',ps)}prev=+ps||0;localStorage.setItem('lastSeen',String(Date.now()))}catch(e){}
+  var newCount=0;
+  cards.forEach(function(k){if(prev>0&&+k.dataset.ts>prev){k.classList.add('new');newCount++}});
+  var nw=document.getElementById('nw');if(nw){nw.hidden=!newCount;nw.textContent='New ('+newCount+')'}
   try{var ls=localStorage.getItem('dealsPrefs');if(ls)P=norm(JSON.parse(ls))}catch(e){}
   refresh();
   fetch('/api/prefs',{credentials:'same-origin',cache:'no-store'})
@@ -568,7 +607,7 @@ const CLIENT_JS = String.raw`(function(){
 function render(items, errors, now, debug) {
   const byId = Object.fromEntries(FEEDS.map((f) => [f.id, f]));
   const live = new Set(items.map((it) => it.source));
-  const chips = [`<button class="chip on" data-src="all">All</button>`, `<button class="chip" id="fy" data-src="foryou" style="--c:#b8860b" hidden>&#9733; For you</button>`]
+  const chips = [`<button class="chip on" data-src="all">All</button>`, `<button class="chip" id="nw" data-src="new" style="--c:#2f9e44" hidden>New</button>`, `<button class="chip" id="fy" data-src="foryou" style="--c:#b8860b" hidden>&#9733; For you</button>`]
     .concat(FEEDS.filter((f) => live.has(f.id)).map((f) => `<button class="chip" data-src="${f.id}" style="--c:${f.color}">${esc(f.name)}</button>`))
     .join('');
 
@@ -577,7 +616,7 @@ function render(items, errors, now, debug) {
     const img = it.image
       ? `<img src="${esc(it.image)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentNode.classList.add('noimg');this.remove()">`
       : '';
-    return `<article class="card" data-src="${it.source}" data-link="${esc(it.link)}" data-title="${esc(it.title.toLowerCase())}" data-text="${esc((it.title + ' ' + it.summary + ' ' + f.name + ' ' + (it.price || '')).toLowerCase())}" style="--c:${f.color}">
+    return `<article class="card" data-src="${it.source}" data-ts="${it.date}" data-link="${esc(it.link)}" data-title="${esc(it.title.toLowerCase())}" data-text="${esc((it.title + ' ' + it.summary + ' ' + f.name + ' ' + (it.price || '')).toLowerCase())}" style="--c:${f.color}">
   <a class="thumb${it.image ? '' : ' noimg'}" href="${esc(it.link)}" target="_blank" rel="noopener noreferrer" aria-hidden="true" tabindex="-1">${img}<span class="ph">${esc(f.name.slice(0, 1))}</span></a>
   <div class="body">
     <div class="meta"><span class="src">${esc(f.name)}</span><span class="mr"><time datetime="${new Date(it.date).toISOString()}">${ago(it.date, now)}</time><span class="acts"><button type="button" class="act" data-a="up" title="More like this" aria-label="More like this">&#128077;</button><button type="button" class="act" data-a="down" title="Hide this and show less like it" aria-label="Hide this">&#128078;</button></span></span></div>
@@ -674,6 +713,7 @@ footer{margin-top:24px;color:var(--muted);font-size:.8rem}
 .sites a{color:var(--muted);text-decoration:none;padding:3px 11px;border-radius:999px;border:1px solid var(--line)}
 .sites a:hover{color:var(--text);border-color:var(--muted)}
 .sites a[aria-current]{background:var(--chip);color:var(--text);border-color:transparent}
+.card.new .src::after{content:"NEW";margin-left:8px;font-size:.62rem;font-weight:800;background:#2f9e44;color:#fff;padding:1px 6px;border-radius:5px;letter-spacing:.04em;vertical-align:1px}
 </style>
 </head>
 <body>

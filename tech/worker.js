@@ -55,6 +55,33 @@ export default {
   },
 };
 
+// ---------- near-duplicate collapse ----------
+// The same story or deal often shows up from two sources with slightly different titles.
+// Keep the newest, fill in a missing image or price from the other copy.
+const DUP_STOP = new Set(['the','and','for','with','from','this','that','your','you','are','free','shipping','off','new','amazon','at','on','in','of','to','a','an','by','up','get','deal','deals','sale']);
+function titleTokens(t) {
+  const m = String(t || '').toLowerCase().match(/[a-z0-9][a-z0-9.+\-]{1,}/g) || [];
+  return new Set(m.filter((w) => !DUP_STOP.has(w)));
+}
+function nearDup(a, b) {
+  if (a.size < 4 || b.size < 4) return false;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  return inter >= 4 && inter / (a.size + b.size - inter) >= 0.6;
+}
+function collapseNearDuplicates(items) {
+  const keep = [], toks = [];
+  for (const it of items) {
+    const t = titleTokens(it.title);
+    const i = toks.findIndex((x) => nearDup(t, x));
+    if (i < 0) { keep.push(it); toks.push(t); continue; }
+    const k = keep[i];
+    if (!k.image && it.image) k.image = it.image;
+    if (!k.price && it.price) { k.price = it.price; k.was = it.was; k.off = it.off; }
+  }
+  return keep;
+}
+
 // ---------- loading ----------
 
 // Loads the feeds, then merges with the articles saved earlier so the page can reach back KEEP_DAYS.
@@ -72,10 +99,10 @@ async function loadWithHistory(env) {
       byLink.set(it.link, prev && !it.image && prev.image ? { ...it, image: prev.image } : it);
     }
     const cutoff = Date.now() - KEEP_DAYS * 86400000;
-    const merged = [...byLink.values()]
+    const mergedAll = [...byLink.values()]
       .filter((it) => it.date >= cutoff)
-      .sort((a, b) => b.date - a.date)
-      .slice(0, HISTORY_MAX);
+      .sort((a, b) => b.date - a.date);
+    const merged = collapseNearDuplicates(mergedAll).slice(0, HISTORY_MAX);
     if (merged.length) await env.NEWS.put('items', JSON.stringify(merged));
     return { items: merged.length ? merged : items, errors };
   } catch (e) {
@@ -96,8 +123,8 @@ async function loadAll() {
   const seen = new Set();
   items = items
     .sort((a, b) => b.date - a.date)
-    .filter((it) => (seen.has(it.link) ? false : (seen.add(it.link), true)))
-    .slice(0, MAX_ITEMS);
+    .filter((it) => (seen.has(it.link) ? false : (seen.add(it.link), true)));
+  items = collapseNearDuplicates(items).slice(0, MAX_ITEMS);
 
   // For a few items that have no image in the feed, look for the article's og:image.
   const missing = items.filter((it) => !it.image).slice(0, OG_IMAGE_LOOKUPS);
@@ -334,7 +361,7 @@ function ago(ms, now) {
 
 function render(items, errors, now) {
   const byId = Object.fromEntries(FEEDS.map((f) => [f.id, f]));
-  const chips = [`<button class="chip on" data-src="all">All</button>`]
+  const chips = [`<button class="chip on" data-src="all">All</button>`, `<button class="chip" id="nw" data-src="new" style="--c:#2f9e44" hidden>New</button>`]
     .concat(FEEDS.map((f) => `<button class="chip" data-src="${f.id}" style="--c:${f.color}">${esc(f.name)}</button>`))
     .join('');
 
@@ -343,7 +370,7 @@ function render(items, errors, now) {
     const img = it.image
       ? `<img src="${esc(it.image)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentNode.classList.add('noimg');this.remove()">`
       : '';
-    return `<article class="card" data-src="${it.source}" data-text="${esc((it.title + ' ' + it.summary + ' ' + f.name).toLowerCase())}" style="--c:${f.color}">
+    return `<article class="card" data-src="${it.source}" data-ts="${it.date}" data-text="${esc((it.title + ' ' + it.summary + ' ' + f.name).toLowerCase())}" style="--c:${f.color}">
   <a class="thumb${it.image ? '' : ' noimg'}" href="${esc(it.link)}" target="_blank" rel="noopener noreferrer" aria-hidden="true" tabindex="-1">${img}<span class="ph">${esc(f.name.slice(0, 1))}</span></a>
   <div class="body">
     <div class="meta"><span class="src">${esc(f.name)}</span><span class="when"><time datetime="${new Date(it.date).toISOString()}">${ago(it.date, now)}</time><button class="share" type="button" data-url="${esc(it.link)}" data-title="${esc(it.title)}" aria-label="Share this article" title="Share"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></button></span></div>
@@ -414,6 +441,7 @@ footer{margin-top:24px;color:var(--muted);font-size:.8rem}
 .sites a{color:var(--muted);text-decoration:none;padding:3px 11px;border-radius:999px;border:1px solid var(--line)}
 .sites a:hover{color:var(--text);border-color:var(--muted)}
 .sites a[aria-current]{background:var(--chip);color:var(--text);border-color:transparent}
+.card.new .src::after{content:"NEW";margin-left:8px;font-size:.62rem;font-weight:800;background:#2f9e44;color:#fff;padding:1px 6px;border-radius:5px;letter-spacing:.04em;vertical-align:1px}
 </style>
 </head>
 <body>
@@ -431,10 +459,15 @@ ${cards}
 (function(){
   var chips=document.querySelectorAll('.chip'),cards=document.querySelectorAll('.card'),
       q=document.getElementById('q'),count=document.getElementById('count'),none=document.getElementById('none'),active='all';
+  var prev=0;
+  try{var ps=sessionStorage.getItem('prevSeen');if(ps===null){ps=localStorage.getItem('lastSeen')||'0';sessionStorage.setItem('prevSeen',ps)}prev=+ps||0;localStorage.setItem('lastSeen',String(Date.now()))}catch(e){}
+  var newCount=0;
+  cards.forEach(function(k){if(prev>0&&+k.dataset.ts>prev){k.classList.add('new');newCount++}});
+  var nw=document.getElementById('nw');if(nw){nw.hidden=!newCount;nw.textContent='New ('+newCount+')'}
   function apply(){
-    var terms=q.value.trim().toLowerCase().split(/\s+/).filter(Boolean),shown=0;
+    var terms=q.value.trim().toLowerCase().split(/\\s+/).filter(Boolean),shown=0;
     cards.forEach(function(k){
-      var ok=(active==='all'||k.dataset.src===active);
+      var ok=(active==='all'||(active==='new'?k.classList.contains('new'):k.dataset.src===active));
       if(ok&&terms.length){var tx=k.dataset.text;for(var i=0;i<terms.length;i++){if(tx.indexOf(terms[i])<0){ok=false;break}}}
       k.hidden=!ok;if(ok)shown++;
     });
