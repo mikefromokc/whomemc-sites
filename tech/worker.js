@@ -409,11 +409,16 @@ p{margin:0;color:var(--muted);font-size:.9rem}
 .nomatch{color:var(--muted);padding:24px 0}
 footer{margin-top:24px;color:var(--muted);font-size:.8rem}
 .err,.empty{color:#b3261e;font-size:.85rem}
+.brand{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px}
+.sites{display:flex;gap:6px;font-size:.85rem}
+.sites a{color:var(--muted);text-decoration:none;padding:3px 11px;border-radius:999px;border:1px solid var(--line)}
+.sites a:hover{color:var(--text);border-color:var(--muted)}
+.sites a[aria-current]{background:var(--chip);color:var(--text);border-color:transparent}
 </style>
 </head>
 <body>
 <div class="wrap">
-<header><h1>${esc(PAGE_TITLE)}</h1><nav class="chips" aria-label="Filter by source">${chips}</nav></header>
+<header><div class="brand"><h1>${esc(PAGE_TITLE)}</h1><nav class="sites" aria-label="My sites"><a href="https://tech.whomemc.com/" aria-current="page">Tech</a><a href="https://deals.whomemc.com/">Deals</a></nav></div><nav class="chips" aria-label="Filter by source">${chips}</nav></header>
 <div class="search"><div class="sbox"><input id="q" type="search" placeholder="Search" autocomplete="off" aria-label="Search"><button id="clr" type="button" aria-label="Clear search" hidden>&times;</button></div><span id="count"></span></div>
 ${empty}
 <main class="grid" id="grid">

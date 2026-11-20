@@ -669,11 +669,16 @@ footer{margin-top:24px;color:var(--muted);font-size:.8rem}
 #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 14px;border-radius:12px;font-size:.9rem;display:flex;gap:12px;align-items:center;z-index:10}
 #toast[hidden]{display:none}
 #toast button{appearance:none;border:0;background:transparent;color:inherit;font:inherit;font-weight:700;text-decoration:underline;cursor:pointer}
+.brand{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px}
+.sites{display:flex;gap:6px;font-size:.85rem}
+.sites a{color:var(--muted);text-decoration:none;padding:3px 11px;border-radius:999px;border:1px solid var(--line)}
+.sites a:hover{color:var(--text);border-color:var(--muted)}
+.sites a[aria-current]{background:var(--chip);color:var(--text);border-color:transparent}
 </style>
 </head>
 <body>
 <div class="wrap">
-<header><h1>${esc(PAGE_TITLE)}</h1><nav class="chips" aria-label="Filter by source">${chips}</nav></header>
+<header><div class="brand"><h1>${esc(PAGE_TITLE)}</h1><nav class="sites" aria-label="My sites"><a href="https://tech.whomemc.com/">Tech</a><a href="https://deals.whomemc.com/" aria-current="page">Deals</a></nav></div><nav class="chips" aria-label="Filter by source">${chips}</nav></header>
 <div class="search"><div class="sbox"><input id="q" type="search" placeholder="Search" autocomplete="off" aria-label="Search"><button id="clr" type="button" aria-label="Clear search" hidden>&times;</button></div><span id="count"></span><button class="pbtn" id="wbtn" type="button" aria-expanded="false">My picks</button></div>
 <section id="wp" hidden>
   <h3>My picks</h3>
