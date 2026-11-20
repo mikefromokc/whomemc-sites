@@ -20,9 +20,17 @@ const CACHE_SECONDS = 600;
 const OG_IMAGE_LOOKUPS = 8; // max article-page lookups for items with no image in the feed
 const UA = 'Mozilla/5.0 (compatible; PersonalTechNewsPage/1.0)';
 
+const ABOUT_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>About - About Apple Tech News</title><meta name="description" content="A personal, ad-free reader that gathers Apple news headlines (iPhone, Mac, iPad, Apple Watch) from public RSS feeds of 9to5Mac, MacRumors, Macworld, iClarified and AppleInsider."></head><body style="font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem"><h1>About Apple Tech News</h1><p>A small personal project that collects headlines from the public RSS feeds of Apple-focused news sites (9to5Mac, MacRumors, Macworld, iClarified, AppleInsider) onto one page.</p><p>Every item links to the original publisher. No accounts, no ads, no tracking, and nothing is sold. Hosted on Cloudflare Workers.</p><p><a href="/">Back to the site</a></p></body></html>`;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === '/robots.txt') {
+      return new Response('User-agent: *\nAllow: /\n', { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+    if (url.pathname === '/about') {
+      return new Response(ABOUT_HTML, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=3600' } });
+    }
     if (url.pathname !== '/' && url.pathname !== '/index.html') {
       return new Response('Not found', { status: 404 });
     }
@@ -391,9 +399,12 @@ function render(items, errors, now) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
+<meta name="robots" content="index,follow">
+<meta name="description" content="A personal, ad-free reader that gathers Apple news headlines (iPhone, Mac, iPad, Apple Watch) from public RSS feeds of 9to5Mac, MacRumors, Macworld, iClarified and AppleInsider.">
+<meta property="og:title" content="Apple Tech News - Apple news headlines from 9to5Mac, MacRumors and more">
+<meta property="og:description" content="A personal, ad-free reader that gathers Apple news headlines (iPhone, Mac, iPad, Apple Watch) from public RSS feeds of 9to5Mac, MacRumors, Macworld, iClarified and AppleInsider.">
 <meta name="color-scheme" content="light dark">
-<title>${esc(PAGE_TITLE)}</title>
+<title>Apple Tech News - Apple news headlines from 9to5Mac, MacRumors and more</title>
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--text:#14171c;--muted:#656d79;--line:#e3e6eb;--chip:#e9ecf1}
 @media (prefers-color-scheme:dark){:root{--bg:#0e1013;--card:#171a1f;--text:#eceef1;--muted:#98a0ab;--line:#262a31;--chip:#22262d}}
@@ -454,7 +465,7 @@ ${empty}
 ${cards}
 </main>
 <p class="nomatch" id="none" hidden>No matching stories.</p>
-<footer>Headlines and images belong to their publishers and link to the original articles. Updated <time id="upd" datetime="${new Date(now).toISOString()}"></time>.${errNote}</footer>
+<footer>Headlines and images belong to their publishers and link to the original articles. <a href="/about">About this site</a>. Updated <time id="upd" datetime="${new Date(now).toISOString()}"></time>.${errNote}</footer>
 </div>
 <script>
 (function(){
