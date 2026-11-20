@@ -139,7 +139,7 @@ async function handlePrefs(request, env, url) {
   const who = (request.headers.get('Cf-Access-Authenticated-User-Email') || '').trim().toLowerCase();
   if (!env.PREFS) return reply({ enabled: false, why: 'no-kv' });
   if (url.hostname !== PREFS_HOST) return reply({ enabled: false, why: 'host' });
-  if (!/^[^\s@<>]+@[^\s@<>]+$/.test(who)) return reply({ enabled: false, why: 'no-email', seen: [...request.headers.keys()].filter((h) => /^cf-access|^cf-connecting|^x-forwarded/i.test(h)) });
+  if (!/^[^\s@<>]+@[^\s@<>]+$/.test(who)) return reply({ enabled: false, why: 'no-email' });
   const key = 'p:' + who;
   try {
     if (request.method === 'GET') {
