@@ -8,6 +8,7 @@ const FEEDS = [
   { id: 'macrumors', name: 'MacRumors', home: 'https://www.macrumors.com',    color: '#d6402f', urls: ['https://feeds.macrumors.com/MacRumors-All', 'https://www.macrumors.com/macrumors.xml'] },
   { id: 'macworld',  name: 'Macworld',  home: 'https://www.macworld.com',     color: '#e8761a', urls: ['https://www.macworld.com/feed'] },
   { id: 'iclarified', name: 'iClarified', home: 'https://www.iclarified.com', color: '#2f9e5b', urls: ['https://www.iclarified.com/rss', 'https://www.iclarified.com/feed'] },
+  { id: 'appleinsider', name: 'AppleInsider', home: 'https://appleinsider.com', color: '#7a4bd1', urls: ['https://appleinsider.com/rss/news/'] },
 ];
 
 const PAGE_TITLE = 'Apple Tech News';

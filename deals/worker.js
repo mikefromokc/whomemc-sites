@@ -594,6 +594,15 @@ const CLIENT_JS = String.raw`(function(){
   cards.forEach(function(k){if(prev>0&&+k.dataset.ts>prev){k.classList.add('new');newCount++}});
   var nw=document.getElementById('nw');if(nw){nw.hidden=!newCount;nw.textContent='New ('+newCount+')'}
   try{var ls=localStorage.getItem('dealsPrefs');if(ls)P=norm(JSON.parse(ls))}catch(e){}
+  try{
+    var hm=/^#watch=(.+)$/.exec(location.hash||'');
+    if(hm){
+      var add=decodeURIComponent(hm[1]).toLowerCase().split(',').map(function(x){return x.trim().slice(0,40)}).filter(Boolean),n=0;
+      add.forEach(function(x){if(P.watch.indexOf(x)<0&&P.watch.length<50){P.watch.push(x);n++}});
+      history.replaceState(null,'',location.pathname+location.search);
+      if(n){save();toast('Added '+n+' words to your watchlist.')}
+    }
+  }catch(e){}
   refresh();
   fetch('/api/prefs',{credentials:'same-origin',cache:'no-store'})
     .then(function(r){return r.ok?r.json():null})
