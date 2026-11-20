@@ -137,7 +137,9 @@ async function handlePrefs(request, env, url) {
   const H = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' };
   const reply = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: H });
   const who = (request.headers.get('Cf-Access-Authenticated-User-Email') || '').trim().toLowerCase();
-  if (!env.PREFS || url.hostname !== PREFS_HOST || !/^[^\s@<>]+@[^\s@<>]+$/.test(who)) return reply({ enabled: false });
+  if (!env.PREFS) return reply({ enabled: false, why: 'no-kv' });
+  if (url.hostname !== PREFS_HOST) return reply({ enabled: false, why: 'host' });
+  if (!/^[^\s@<>]+@[^\s@<>]+$/.test(who)) return reply({ enabled: false, why: 'no-email' });
   const key = 'p:' + who;
   try {
     if (request.method === 'GET') {
@@ -157,7 +159,7 @@ async function handlePrefs(request, env, url) {
     return reply({ error: 'method not allowed' }, 405);
   } catch (e) {
     console.log('prefs failed', e && e.message);
-    return reply({ enabled: false });
+    return reply({ enabled: false, why: 'error' });
   }
 }
 
