@@ -18,68 +18,10 @@ const CACHE_SECONDS = 300; // deals move fast
 const OG_IMAGE_LOOKUPS = 8; // max article-page lookups for items with no image in the feed
 const UA = 'Mozilla/5.0 (compatible; PersonalDealsPage/1.0)';
 
-// ---- Sign-in alert emails (Cloudflare Email Routing, send_email binding "EMAIL") ----
-// Worker variables (plain text, set in the dashboard):
-//   ALERT_TO  = address that receives the alerts (must be verified in Email Routing)
-//   ME_EMAILS = comma-separated list of your own sign-in addresses (marks "you" vs "guest")
-import { EmailMessage } from 'cloudflare:email';
-
-const ALERT_FROM = 'alerts@whomemc.com';
-const ALERT_QUIET_SECONDS = 12 * 3600; // one email per person + device + network per 12 hours
-
-async function loginAlert(request, env, site) {
-  try {
-    const who = (request.headers.get('Cf-Access-Authenticated-User-Email') || '').trim().toLowerCase();
-    if (!who || !env.EMAIL || !env.ALERT_TO || !/^[^\s@<>]+@[^\s@<>]+$/.test(who)) return;
-    const ip = request.headers.get('CF-Connecting-IP') || '';
-    const ua = (request.headers.get('User-Agent') || '').replace(/[\r\n]+/g, ' ').slice(0, 200);
-    const keyBytes = new TextEncoder().encode(who + '|' + ip + '|' + ua);
-    const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', keyBytes))].slice(0, 12).map(b => b.toString(16).padStart(2, '0')).join('');
-    const cache = caches.default;
-    const key = new Request('https://alerts.invalid/' + site.replace(/\W/g, '') + '/' + hash);
-    if (await cache.match(key)) return;
-    await cache.put(key, new Response('1', { headers: { 'Cache-Control': 'max-age=' + ALERT_QUIET_SECONDS } }));
-
-    const cf = request.cf || {};
-    const place = [cf.city, cf.region, cf.country].filter(Boolean).join(', ') || 'Unknown';
-    const device = (/iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Macintosh/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows PC' : 'Unknown device')
-      + ' · ' + (/Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Unknown browser');
-    const when = new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' (Central)';
-    const me = String(env.ME_EMAILS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-    const mine = me.includes(who);
-    const name = who.split('@')[0].replace(/\+.*$/, '');
-    const subject = (mine ? 'You' : name) + ' signed in to ' + site;
-    const text = [
-      site, 'Someone signed in.', '',
-      'Who:     ' + who + (mine ? ' (you)' : ' (guest)'),
-      'When:    ' + when,
-      'Where:   ' + place + ' (approximate, from the network)',
-      'Device:  ' + device,
-      'Network: ' + ip, '',
-      mine ? "If this wasn't you, sign out everywhere in Cloudflare Zero Trust and change your password." :
-        "If this isn't someone you invited, remove their email in Cloudflare Zero Trust > Access > Policies.",
-    ].join('\r\n');
-    const mime = [
-      'From: ' + site + ' alerts <' + ALERT_FROM + '>',
-      'To: ' + env.ALERT_TO,
-      'Subject: ' + subject.replace(/[\r\n]+/g, ' '),
-      'Message-ID: <' + crypto.randomUUID() + '@whomemc.com>',
-      'Date: ' + new Date().toUTCString(),
-      'MIME-Version: 1.0',
-      'Content-Type: text/plain; charset=utf-8',
-      'Content-Transfer-Encoding: 8bit',
-      '', text,
-    ].join('\r\n');
-    await env.EMAIL.send(new EmailMessage(ALERT_FROM, env.ALERT_TO, mime));
-  } catch (e) { console.log('loginAlert failed', e && e.message); }
-}
-// ---- end sign-in alert ----
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/api/prefs') return handlePrefs(request, env, url);
-    ctx.waitUntil(loginAlert(request, env, 'Deals'));
     if (url.pathname !== '/' && url.pathname !== '/index.html') {
       return new Response('Not found', { status: 404 });
     }

@@ -3,16 +3,10 @@
 Cloudflare Workers behind tech.whomemc.com and deals.whomemc.com. Each folder is one single-file Worker.
 
 - `tech/` – Apple Tech News (RSS reader, 7-day history in KV, hourly cron)
-- `deals/` – Deals (Slickdeals, DealNews and more)
+- `deals/` – Deals (Slickdeals, DealNews and more), with likes, hides, a watchlist and a "For you" tab
 
-Both sit behind Cloudflare Access and email a sign-in alert (via Email Routing) when someone visits.
+Both sites are public (no login). Picks on the deals site are saved in the visitor's browser. If Cloudflare Access is ever put in front of
+deals.whomemc.com, the picks also sync to the signed-in person's account (KV namespace `PREFS`) automatically.
 
-## Settings that live in Cloudflare, not in this repo
-- Worker variables `ALERT_TO` (where alerts go) and `ME_EMAILS` (your own sign-in addresses, to label "you" vs "guest")
-- Access policies, custom domains and the verified alert address in Email Routing
-
-Deploy with `npx wrangler deploy --keep-vars` from inside a Worker's folder (this keeps the variables above).
-Set each Worker's Build root directory to `tech` or `deals` and its deploy command to `npx wrangler deploy --keep-vars`.
-
-
-Deploys run automatically from Cloudflare Workers Builds on every push to main (tech and deals Workers, connected Nov 19, 2026).
+Deploys run automatically from Cloudflare Workers Builds on every push to `main`. Each Worker's build root directory is `tech` or `deals`,
+and the deploy command is `npx wrangler deploy --keep-vars`.
