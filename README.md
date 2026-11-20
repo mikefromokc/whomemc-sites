@@ -13,3 +13,6 @@ Both sit behind Cloudflare Access and email a sign-in alert (via Email Routing) 
 
 Deploy with `npx wrangler deploy --keep-vars` from inside a Worker's folder (this keeps the variables above).
 Set each Worker's Build root directory to `tech` or `deals` and its deploy command to `npx wrangler deploy --keep-vars`.
+
+
+Deploys run automatically from Cloudflare Workers Builds on every push to main (tech and deals Workers, connected Nov 19, 2026).
